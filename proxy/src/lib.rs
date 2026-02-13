@@ -1,22 +1,66 @@
-use std::error;
+use std::{collections::HashMap, io};
 
-pub fn parse_header(buffer: &Vec<u8>, header_end: usize) -> [u8] {
-    let headers = buffer[..header_end];
-    headers
+struct HttpRequest {
+    method: String,
+    uri: String,
+    http_version: String,
+    headers: HashMap<String, String>,
+    body: Option<Vec<u8>>,
+    body_start_idx: usize,
 }
 
-pub fn header_validation(header: &[u8]) -> Result<&str, error> {
+/// GET /api/users HTTP/1.1\r\n
+/// Host: example.com\r\n
+/// User-Agent: curl/8.0.1\r\n
+/// Accept: */*\r\n
+/// Content-Length: 5\r\n
+/// \r\n
+/// hello
+pub fn parse_header(header: &[u8], header_end: usize) -> Result<HttpRequest, io::Error> {
+    let header_string = String::from_utf8_lossy(&header.to_vec());
+    let http_request_header = header_validation(&header_string, header_end: usize);
+    http_request_header
+}
+
+pub fn header_validation(header: &str, header_end: usize) -> Result<HttpRequest, io::Error> {
     // Extract request line
     // Validate token rules
     // Validate version
     // Parse headers line by line
     // enforce uniqueness rules
-    for line in header.split(|&b| b == b"\r\n") {}
-}
+    let mut lines = header.lines();
 
-fn one_colon_in_header(&header: [u8]) {
-    // reject if
-    // no colon
-    // colon at pos 0
-    // multiple colon before val begin
+    // Parse request line
+    let request_line = lines.next().expect("missing request line");
+    let request_parts: Vec<&str> = request_line.split_whitespace().collect();
+    let method = request_parts[0].to_string();
+    let uri = request_parts[1].to_string();
+    let http_version = request_parts[2].to_string();
+
+    // Parse the headers
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(":") {
+            let trimmed_key = key.trim().to_string();
+            let trimmed_value = value.trim().to_string();
+
+            /// for further checking try to check if the key is null.
+            headers.insert(trimmed_key, trimmed_value);
+        }
+    }
+    let body_start: usize = header_end + 4;
+    // Store it in the struct
+    let parsed_request = HttpRequest {
+        method: method,
+        uri: uri,
+        http_version: http_version,
+        headers: headers,
+        body: None,
+        body_start_idx: body_start,
+    };
+    println!("The parsed output is: {}", parsed_request);
+    Ok(parsed_request)
 }

@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 /// 2. Write all that data to the backend connection.
 /// 3. Read all data from the backend connection.
 /// 4. Write all that data to the client connection.
-async fn process_socket(mut socket: TcpStream, mut backend: TcpStream) -> tokio::io::Result<()> {
+async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
     // function to be taken after the connection
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut temp = [0u8; 1024];
@@ -25,22 +25,27 @@ async fn process_socket(mut socket: TcpStream, mut backend: TcpStream) -> tokio:
 
         buf.extend_from_slice(&temp[..n]);
 
-        if !buffer_window_end(buf) {
-            temp = [0; 1024];
-            continue;
+        if buffer_window_end(&buf) {
+            println!("End of headers found");
+            break;
         }
-
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let (headers, header_end) = parse_header(buf, pos + 4);
-            buf.drain(..header_end);
-        }
-
-        // Now we need to validate the header in the lib
     }
+    // connect to the backend server will be more complex need to reimplemnet it later.
+    let mut backend_socket = TcpStream::connect("127.0.0.1:81").await?;
+    println!("Connected to the backend");
+
+    // taking out the header from the request
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        let head = buf[..pos];
+        let header = parse_header(&head, pos);
+        buf.drain(..pos + 4);
+    }
+
     Ok(())
 }
 
-async fn handle_client(mut client: TcpStream) -> io::Result<()> {
+// will change just for end product.
+async fn handle_client1(mut client: TcpStream) -> io::Result<()> {
     let mut backend = TcpStream::connect("127.0.0.1:81").await?;
     copy_bidirectional(&mut client, &mut backend).await?;
     Ok(())
