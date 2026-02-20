@@ -1,66 +1,126 @@
-use std::{collections::HashMap, io};
+use std::collections::HashMap;
 
-struct HttpRequest {
-    method: String,
-    uri: String,
-    http_version: String,
-    headers: HashMap<String, String>,
-    body: Option<Vec<u8>>,
-    body_start_idx: usize,
+#[derive(Debug)]
+pub enum ParseError {
+    InvalidHeader,
+    // Add more specific error types as needed
 }
 
-/// GET /api/users HTTP/1.1\r\n
-/// Host: example.com\r\n
-/// User-Agent: curl/8.0.1\r\n
-/// Accept: */*\r\n
-/// Content-Length: 5\r\n
-/// \r\n
-/// hello
-pub fn parse_header(header: &[u8], header_end: usize) -> Result<HttpRequest, io::Error> {
-    let header_string = String::from_utf8_lossy(&header.to_vec());
-    let http_request_header = header_validation(&header_string, header_end: usize);
-    http_request_header
+#[derive(Debug)]
+pub enum BodyKind {
+    None,
+    ContentLength(usize),
+    Chunked,
 }
 
-pub fn header_validation(header: &str, header_end: usize) -> Result<HttpRequest, io::Error> {
-    // Extract request line
-    // Validate token rules
-    // Validate version
-    // Parse headers line by line
-    // enforce uniqueness rules
-    let mut lines = header.lines();
+pub struct RequestMeta {
+    pub body_kind: BodyKind,
+    pub connection_close: bool,
+    pub host: Option<Vec<u8>>,
+    pub method: Vec<u8>,
+    pub uri: Vec<u8>,
+    pub http_version: Vec<u8>,
+}
 
-    // Parse request line
-    let request_line = lines.next().expect("missing request line");
-    let request_parts: Vec<&str> = request_line.split_whitespace().collect();
-    let method = request_parts[0].to_string();
-    let uri = request_parts[1].to_string();
-    let http_version = request_parts[2].to_string();
+pub struct HeadParser {
+    cursor: usize,
+    pub lines: Vec<Vec<u8>>,
+}
 
-    // Parse the headers
-    let mut headers: HashMap<String, String> = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(":") {
-            let trimmed_key = key.trim().to_string();
-            let trimmed_value = value.trim().to_string();
+pub enum ParseEvent<'a> {
+    Line(&'a [u8]),
+    End,
+    NeedMore,
+}
 
-            /// for further checking try to check if the key is null.
-            headers.insert(trimmed_key, trimmed_value);
+impl HeadParser {
+    pub fn new() -> Self {
+        Self {
+            cursor: 0,
+            lines: Vec::new(),
         }
     }
-    let body_start: usize = header_end + 4;
-    // Store it in the struct
-    let parsed_request = HttpRequest {
-        method: method,
-        uri: uri,
-        http_version: http_version,
-        headers: headers,
-        body: None,
-        body_start_idx: body_start,
-    };
-    println!("The parsed output is: {}", parsed_request);
-    Ok(parsed_request)
+
+    pub fn advance<'a>(&mut self, buf: &'a [u8]) -> ParseEvent<'a> {
+        if self.cursor >= buf.len() {
+            return ParseEvent::NeedMore;
+        }
+
+        let remaining = &buf[self.cursor..];
+
+        if let Some(pos) = remaining.windows(2).position(|w| w == b"\r\n") {
+            if pos == 0 {
+                self.cursor += 2;
+                return ParseEvent::End;
+            }
+            let line = &remaining[..pos];
+            self.lines.push(line.to_vec()); // Store the line
+            self.cursor += pos + 2;
+            return ParseEvent::Line(line);
+        }
+        ParseEvent::NeedMore
+    }
+
+    pub fn parse_request_meta(&self) -> Result<RequestMeta, ParseError> {
+        if self.lines.is_empty() {
+            return Err(ParseError::InvalidHeader);
+        }
+
+        // Parse the request line (e.g., GET /index.html HTTP/1.1)
+        let request_line = &self.lines[0];
+        let parts: Vec<&[u8]> = request_line.splitn(3, |&b| b == b' ').collect();
+        if parts.len() != 3 {
+            return Err(ParseError::InvalidHeader);
+        }
+        let method = parts[0].to_vec();
+        let uri = parts[1].to_vec();
+        let http_version = parts[2].to_vec();
+
+        let mut content_length: Option<usize> = None;
+        let mut is_chunked = false;
+        let mut connection_close = false;
+        let mut host: Option<Vec<u8>> = None;
+
+        // Process other headers
+        for line in self.lines.iter().skip(1) {
+            if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+                let name = &line[..colon_pos];
+                let value = &line[colon_pos + 1..].trim_ascii_start(); // Trim leading whitespace
+
+                if name.eq_ignore_ascii_case(b"Content-Length") {
+                    let s = std::str::from_utf8(value).map_err(|_| ParseError::InvalidHeader)?;
+                    content_length = Some(s.parse().map_err(|_| ParseError::InvalidHeader)?);
+                } else if name.eq_ignore_ascii_case(b"Transfer-Encoding") {
+                    if value.eq_ignore_ascii_case(b"chunked") {
+                        is_chunked = true;
+                    }
+                } else if name.eq_ignore_ascii_case(b"Connection") {
+                    if value.eq_ignore_ascii_case(b"close") {
+                        connection_close = true;
+                    }
+                } else if name.eq_ignore_ascii_case(b"Host") {
+                    host = Some(value.to_vec());
+                }
+            }
+        }
+
+        let body_kind = if is_chunked {
+            BodyKind::Chunked
+        } else if let Some(len) = content_length {
+            BodyKind::ContentLength(len)
+        } else {
+            BodyKind::None
+        };
+
+        Ok(RequestMeta {
+            body_kind,
+            connection_close,
+            host,
+            method,
+            uri,
+            http_version,
+        })
+    }
 }
+
+/* */
