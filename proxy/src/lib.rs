@@ -23,7 +23,7 @@ pub struct RequestMeta {
 }
 
 pub struct HeadParser {
-    cursor: usize,
+    pub cursor: usize,
     pub lines: Vec<Vec<u8>>,
 }
 

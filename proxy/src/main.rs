@@ -9,9 +9,9 @@ use tokio::net::{TcpListener, TcpStream};
 enum ConnectionState {
     Idle,
     ReadingHeaders,
-    ReadingBody(RequestMeta), // Holds RequestMeta once headers are parsed
-    WaitingBackend,
-    RelayingResponse,
+    ReadingBody(RequestMeta, Vec<u8>), // Holds RequestMeta and initial body
+    WaitingBackend(RequestMeta, Vec<u8>), // Holds RequestMeta and full body
+    RelayingResponse(TcpStream), // Holds the backend socket
     KeepAliveDecision,
     Closed,
 }
@@ -48,17 +48,23 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                             // Headers are complete, parse RequestMeta
                             match parser.parse_request_meta() {
                                 Ok(req_meta) => {
+                                    // Extract the initial body part that was read with headers
+                                    let initial_body = buf[parser.cursor..].to_vec();
+                                    
                                     // Decide next state based on body_kind
                                     state = match req_meta.body_kind {
-                                        BodyKind::None => ConnectionState::WaitingBackend,
+                                        BodyKind::None => ConnectionState::WaitingBackend(req_meta, initial_body),
                                         BodyKind::ContentLength(_) | BodyKind::Chunked => {
-                                            ConnectionState::ReadingBody(req_meta)
+                                            ConnectionState::ReadingBody(req_meta, initial_body)
                                         }
                                     };
-                                    // Clear parser lines for the next request if connection is kept alive
-                                    parser.lines.clear();
-                                    // Clear buffer for the next request as headers are processed
+                                    
+                                    // We keep buf as is for now if we want to relay headers later, 
+                                    // or clear it if we'll reconstruct headers.
+                                    // For now, let's clear it since we have RequestMeta and initial_body.
                                     buf.clear();
+                                    parser.lines.clear();
+                                    parser.cursor = 0;
                                     break; // Exit inner loop, proceed to next state
                                 }
                                 Err(e) => {
@@ -75,22 +81,85 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                     }
                 }
             }
-            ConnectionState::ReadingBody(req_meta) => {
-                println!("Reading body based on {:?}", req_meta.body_kind);
-                // Placeholder for reading the body
-                state = ConnectionState::WaitingBackend;
+            ConnectionState::ReadingBody(req_meta, mut body) => {
+                match req_meta.body_kind {
+                    BodyKind::ContentLength(len) => {
+                        if body.len() >= len {
+                            state = ConnectionState::WaitingBackend(req_meta, body);
+                        } else {
+                            let n = socket.read(&mut temp).await?;
+                            if !is_valid_read_len(n) {
+                                state = ConnectionState::Closed;
+                            } else {
+                                body.extend_from_slice(&temp[..n]);
+                                state = ConnectionState::ReadingBody(req_meta, body);
+                            }
+                        }
+                    }
+                    BodyKind::Chunked => {
+                        println!("Reading chunked body (not yet implemented)");
+                        state = ConnectionState::Closed; // Placeholder
+                    }
+                    BodyKind::None => {
+                        state = ConnectionState::WaitingBackend(req_meta, body);
+                    }
+                }
             }
-            ConnectionState::WaitingBackend => {
+            ConnectionState::WaitingBackend(req_meta, body) => {
                 println!("Waiting for backend connection...");
                 // Placeholder for connecting to backend and forwarding request
                 let mut backend_socket = TcpStream::connect("127.0.0.1:81").await?;
                 println!("Connected to the backend");
-                state = ConnectionState::RelayingResponse;
+                
+                // For now, let's just relay what we have. 
+                // We need to reconstruct the headers or keep the original ones.
+                // Reconstructing is cleaner for a Load Balancer.
+                let mut request = format!(
+                    "{} {} {:?}\r\n",
+                    String::from_utf8_lossy(&req_meta.method),
+                    String::from_utf8_lossy(&req_meta.uri),
+                    String::from_utf8_lossy(&req_meta.http_version)
+                ).into_bytes();
+                
+                // Add Host header if present
+                if let Some(host) = &req_meta.host {
+                    request.extend_from_slice(b"Host: ");
+                    request.extend_from_slice(host);
+                    request.extend_from_slice(b"\r\n");
+                }
+                
+                // Add other headers... this is where we'd need more logic to preserve headers.
+                // For learning, let's just add Content-Length if body is present.
+                if !body.is_empty() {
+                    request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+                }
+                
+                request.extend_from_slice(b"\r\n");
+                request.extend(body);
+                
+                use tokio::io::AsyncWriteExt;
+                backend_socket.write_all(&request).await?;
+                
+                state = ConnectionState::RelayingResponse(backend_socket);
             }
-            ConnectionState::RelayingResponse => {
+            ConnectionState::RelayingResponse(mut backend_socket) => {
                 println!("Relaying response...");
-                // Placeholder for relaying response
-                state = ConnectionState::KeepAliveDecision;
+                // Stream from backend to client
+                let mut backend_buf = [0u8; 1024];
+                match backend_socket.read(&mut backend_buf).await {
+                    Ok(0) => {
+                        state = ConnectionState::KeepAliveDecision;
+                    }
+                    Ok(n) => {
+                        use tokio::io::AsyncWriteExt;
+                        socket.write_all(&backend_buf[..n]).await?;
+                        state = ConnectionState::RelayingResponse(backend_socket);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read from backend: {}", e);
+                        state = ConnectionState::Closed;
+                    }
+                }
             }
             ConnectionState::KeepAliveDecision => {
                 println!("Deciding on keep-alive...");
