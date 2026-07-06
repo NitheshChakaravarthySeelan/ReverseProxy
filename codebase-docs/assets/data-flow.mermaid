@@ -1,0 +1,34 @@
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant Parser as HeadParser
+    participant Backend
+
+    Client->>Proxy: TCP SYN
+    Proxy->>Client: TCP SYN-ACK
+    Client->>Proxy: TCP ACK
+    Client->>Proxy: HTTP GET /index.html HTTP/1.1\r\nHost: ...\r\n\r\n
+
+    Note over Proxy,Parser: State: ReadingHeaders
+    loop Until \r\n\r\n
+        Proxy->>Parser: advance(buf)
+        Parser-->>Proxy: Line / NeedMore / End
+    end
+    Proxy->>Parser: parse_request_meta()
+    Parser-->>Proxy: RequestMeta { method, uri, host, body_kind }
+
+    Note over Proxy: State: WaitingBackend (no body)
+
+    Proxy->>Backend: TCP connect :81
+    Backend->>Proxy: TCP accept
+    Proxy->>Backend: Reconstructed HTTP request
+
+    Note over Proxy: State: RelayingResponse
+
+    Backend->>Proxy: HTTP 200 OK\r\n...
+    loop Until backend closes
+        Proxy->>Client: relay bytes
+    end
+
+    Note over Proxy: State: KeepAliveDecision → Closed
+    Proxy->>Client: TCP FIN

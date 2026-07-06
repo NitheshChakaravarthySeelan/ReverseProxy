@@ -1,0 +1,21 @@
+graph TB
+    subgraph "proxy crate"
+        Listener["TcpListener<br/>:80"]
+        StateMachine["handle_client()<br/>Connection State Machine"]
+        Parser["HeadParser<br/>Incremental HTTP Parser"]
+        BackendConn["TcpStream<br/>→ :81"]
+    end
+
+    subgraph "client crate"
+        TestClient["Test TCP Client<br/>sends 'hello server'"]
+    end
+
+    subgraph "exercise crate"
+        CrlfFinder["crlf_finder.rs<br/>\\r\\n byte finder"]
+        Scratch["main.rs<br/>placeholder"]
+    end
+
+    Listener -->|"accepts"| StateMachine
+    StateMachine -->|"reads bytes"| Parser
+    StateMachine -->|"connects to"| BackendConn
+    TestClient -.->|"manual test"| Listener
