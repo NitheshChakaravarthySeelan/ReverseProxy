@@ -123,18 +123,33 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
             ConnectionState::WaitingBackend(req_meta, raw_headers, body) => {
                 println!("Waiting for backend connection...");
 
-                let backend_addr = pool.next_backend();
+                let backend_addr = match pool.next_backend().await {
+                    Some(addr) => addr,
+                    None => {
+                        eprintln!("No healthy backends available");
+                        state = ConnectionState::Closed;
+                        continue;
+                    }
+                };
                 let mut backend_socket = match conn_pool.borrow(backend_addr).await {
                     Some(s) => {
                         println!("Reusing pooled connection to {backend_addr}");
                         s
                     }
                     None => {
-                        let s = TcpStream::connect(backend_addr).await?;
-                        println!("New connection to {backend_addr}");
-                        s
+                        match TcpStream::connect(backend_addr).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("Failed to connect to backend {backend_addr}: {e}");
+                                pool.mark_unhealthy(backend_addr).await;
+                                state = ConnectionState::Closed;
+                                continue;
+                            }
+                        }
                     }
                 };
+
+                pool.mark_healthy(backend_addr).await;
 
                 use tokio::io::AsyncWriteExt;
                 let mut request = raw_headers.clone();
@@ -312,6 +327,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "127.0.0.1:81".parse().unwrap(),
     ]));
     let conn_pool: SharedConnPool = Arc::new(BackendConnPool::new());
+
+    pool.start_active_health_checks(10, "/health").await;
 
     let listener = TcpListener::bind("127.0.0.1:80").await?;
 
