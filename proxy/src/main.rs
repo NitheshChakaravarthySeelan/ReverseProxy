@@ -1,7 +1,12 @@
 mod check_valid;
+mod lb;
+
 use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use check_valid::is_valid_read_len;
+use lb::{BackendConnPool, BackendPool, SharedBackendPool, SharedConnPool};
 use proxy::{HeadParser, ParseEvent, RequestMeta, BodyKind, ParseError};
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,11 +19,11 @@ struct ResponseMeta {
 enum ConnectionState {
     Idle,
     ReadingHeaders,
-    ReadingBody(RequestMeta, Vec<u8>, Vec<u8>), // (meta, raw_headers, body)
-    WaitingBackend(RequestMeta, Vec<u8>, Vec<u8>), // (meta, raw_headers, body)
-    ReadingResponseHeaders(RequestMeta, Vec<u8>, Vec<u8>, Vec<u8>, TcpStream),
-    ReadingResponseBody(RequestMeta, Vec<u8>, Vec<u8>, TcpStream, usize, bool),
-    KeepAliveDecision(bool), // true if connection should close
+    ReadingBody(RequestMeta, Vec<u8>, Vec<u8>),
+    WaitingBackend(RequestMeta, Vec<u8>, Vec<u8>),
+    ReadingResponseHeaders(RequestMeta, Vec<u8>, Vec<u8>, Vec<u8>, SocketAddr, TcpStream),
+    ReadingResponseBody(RequestMeta, Vec<u8>, Vec<u8>, TcpStream, usize, bool, SocketAddr),
+    KeepAliveDecision(bool, Option<(SocketAddr, TcpStream)>),
     Closed,
 }
 
@@ -26,7 +31,7 @@ enum ConnectionState {
 /// 2. Write all that data to the backend connection.
 /// 3. Read all that data from the backend connection.
 /// 4. Write all that data to the client connection.
-async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
+async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool: SharedConnPool) -> tokio::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut temp = [0u8; 1024];
     let mut parser = HeadParser::new();
@@ -117,8 +122,19 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
             }
             ConnectionState::WaitingBackend(req_meta, raw_headers, body) => {
                 println!("Waiting for backend connection...");
-                let mut backend_socket = TcpStream::connect("127.0.0.1:81").await?;
-                println!("Connected to the backend");
+
+                let backend_addr = pool.next_backend();
+                let mut backend_socket = match conn_pool.borrow(backend_addr).await {
+                    Some(s) => {
+                        println!("Reusing pooled connection to {backend_addr}");
+                        s
+                    }
+                    None => {
+                        let s = TcpStream::connect(backend_addr).await?;
+                        println!("New connection to {backend_addr}");
+                        s
+                    }
+                };
 
                 use tokio::io::AsyncWriteExt;
                 let mut request = raw_headers.clone();
@@ -126,11 +142,11 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                 backend_socket.write_all(&request).await?;
 
                 state = ConnectionState::ReadingResponseHeaders(
-                    req_meta, raw_headers, body, Vec::new(), backend_socket,
+                    req_meta, raw_headers, body, Vec::new(), backend_addr, backend_socket,
                 );
             }
             ConnectionState::ReadingResponseHeaders(
-                req_meta, raw_headers, body, mut resp_buf, mut backend_socket,
+                req_meta, raw_headers, body, mut resp_buf, backend_addr, mut backend_socket,
             ) => {
                 let n = backend_socket.read(&mut temp).await;
                 match n {
@@ -159,21 +175,21 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                     match resp_meta.content_length {
                         Some(total_len) if body_len < total_len => {
                             state = ConnectionState::ReadingResponseBody(
-                                req_meta, raw_headers, body, backend_socket, total_len - body_len, should_close,
+                                req_meta, raw_headers, body, backend_socket, total_len - body_len, should_close, backend_addr,
                             );
                         }
                         _ => {
-                            state = ConnectionState::KeepAliveDecision(should_close);
+                            state = ConnectionState::KeepAliveDecision(should_close, Some((backend_addr, backend_socket)));
                         }
                     }
                 } else {
                     state = ConnectionState::ReadingResponseHeaders(
-                        req_meta, raw_headers, body, resp_buf, backend_socket,
+                        req_meta, raw_headers, body, resp_buf, backend_addr, backend_socket,
                     );
                 }
             }
             ConnectionState::ReadingResponseBody(
-                req_meta, raw_headers, body, mut backend_socket, mut remaining, should_close,
+                req_meta, raw_headers, body, mut backend_socket, mut remaining, should_close, backend_addr,
             ) => {
                 let n = backend_socket.read(&mut temp).await;
                 match n {
@@ -184,10 +200,10 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                         remaining -= to_write;
 
                         if remaining == 0 {
-                            state = ConnectionState::KeepAliveDecision(should_close);
+                            state = ConnectionState::KeepAliveDecision(should_close, Some((backend_addr, backend_socket)));
                         } else {
                             state = ConnectionState::ReadingResponseBody(
-                                req_meta, raw_headers, body, backend_socket, remaining, should_close,
+                                req_meta, raw_headers, body, backend_socket, remaining, should_close, backend_addr,
                             );
                         }
                     }
@@ -196,11 +212,14 @@ async fn handle_client(mut socket: TcpStream) -> tokio::io::Result<()> {
                     }
                 }
             }
-            ConnectionState::KeepAliveDecision(should_close) => {
+            ConnectionState::KeepAliveDecision(should_close, backend_socket) => {
                 if should_close {
-                    println!("Closing connection (Connection: close)");
+                    println!("Closing connection");
                     state = ConnectionState::Closed;
                 } else {
+                    if let Some((addr, stream)) = backend_socket {
+                        conn_pool.return_conn(addr, stream).await;
+                    }
                     println!("Keeping connection alive, waiting for next request");
                     buf.clear();
                     parser = HeadParser::new();
@@ -289,16 +308,20 @@ async fn handle_client1(mut client: TcpStream) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool: SharedBackendPool = Arc::new(BackendPool::new(vec![
+        "127.0.0.1:81".parse().unwrap(),
+    ]));
+    let conn_pool: SharedConnPool = Arc::new(BackendConnPool::new());
+
     let listener = TcpListener::bind("127.0.0.1:80").await?;
 
     loop {
-        // Accepting connection async socket should be mut cause we will be writing back the
-        // response in the socket.
-        // it would give socket and addr
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
+        let pool = Arc::clone(&pool);
+        let conn_pool = Arc::clone(&conn_pool);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
+            if let Err(e) = handle_client(socket, pool, conn_pool).await {
                 eprintln!("connection error: {e}");
             }
         });
