@@ -1,183 +1,158 @@
 # Load Balancer & Reverse Proxy
 
-A **learning project** that implements a TCP reverse proxy with HTTP header awareness, built from scratch in Rust. Designed to evolve from a raw byte-pipe proxy into a feature-rich, multi-algorithm load balancer.
+> **A production-grade TCP reverse proxy and load balancer, built from scratch in Rust.**
+> Every layer — TCP accept, HTTP parsing, load balancing, health checks — is hand-implemented.
 
 ```
-client ──> TCP ──> proxy ──> TCP ──> backend
+curl http://localhost:80 ──> proxy ──> backend:81
 ```
 
 ---
 
-## Features
+## What It Does
 
-- **TCP Reverse Proxy** – Accepts connections on a frontend port and forwards them to a backend server.
-- **HTTP Header Parsing** – Incrementally parses HTTP request lines, headers, Content-Length, and chunked transfer encoding.
-- **State Machine Architecture** – Each connection progresses through explicit states: `ReadingHeaders` → `ReadingBody` → `WaitingBackend` → `RelayingResponse`.
-- **Async I/O** – Built on Tokio for non-blocking, high-concurrency connection handling.
-- **Raw Bidirectional Proxying** – Supports `io::copy_bidirectional` for transparent TCP passthrough.
+Accepts HTTP connections, parses request headers incrementally as bytes arrive, selects a backend via round-robin (skipping unhealthy ones), forwards the request verbatim, streams the response back to the client — then keeps the connection alive for the next request.
+
+All configurable through a TOML file. All observable via Prometheus metrics.
 
 ---
 
 ## Architecture
 
-The proxy is a **multi-crate Cargo workspace** with three packages:
-
-| Crate       | Role                                                  |
-|-------------|-------------------------------------------------------|
-| `proxy`     | Core proxy server – TCP listener, state machine, HTTP parser |
-| `client`    | Minimal TCP test client for manual testing            |
-| `exercise`  | Scratch code / experimental utilities                 |
-
-### Connection Lifecycle
-
-Each client connection is handled by an async state machine:
-
-```
-Idle ──> ReadingHeaders ──> ReadingBody ──> WaitingBackend ──> RelayingResponse ──> Closed
+```mermaid
+graph LR
+    Client -->|TCP :80| Proxy
+    Proxy -->|TCP :81| Backend1
+    Proxy -->|TCP :82| Backend2
+    Proxy -->|TCP :9090| Metrics
 ```
 
-The proxy reads the client's HTTP request, parses headers to determine routing metadata (method, URI, host, body type), then establishes a connection to the backend and relays both the reconstructed request and the backend's response.
+Each connection runs through an explicit state machine:
 
-### Crate Structure
+```
+ReadingHeaders → ReadingBody → WaitingBackend → ReadingResponseHeaders → ReadingResponseBody → KeepAliveDecision
+                                                                                                        │
+                                                                                     (keep-alive) ──────┘
+                                                                                     (close) ──── Closed
+```
+
+### Core Modules
+
+| Module | Responsibility |
+|--------|---------------|
+| `main.rs` | TCP listener, per-connection state machine |
+| `lib.rs` | Incremental HTTP header parser (`HeadParser`, `RequestMeta`) |
+| `lb/mod.rs` | Backend pool, round-robin, connection pool, passive + active health checks |
+| `config.rs` | TOML configuration deserialization |
+
+### Tech Stack
+
+| Layer | Choice |
+|-------|--------|
+| Language | Rust (edition 2024) |
+| Async Runtime | Tokio 1.49 |
+| HTTP Parsing | Custom incremental parser (no regex, no hyper) |
+| Configuration | TOML via serde |
+| Logging | tracing (structured, env-filter) |
+| Metrics | Prometheus text format on `:9090/metrics` |
+
+---
+
+## Features
+
+- **Incremental HTTP Parser** — processes bytes as they arrive; handles `Content-Length` and `Transfer-Encoding: chunked`
+- **Header-Verbatim Forwarding** — preserves every header (Auth, Cookie, Accept, …)
+- **Keep-Alive** — parses response headers, reads exact body length, reuses TCP connection for pipelined requests
+- **Round-Robin Load Balancing** — lock-free atomic counter across all connections
+- **Connection Pooling** — idle backend TCP connections are recycled instead of re-established
+- **Passive Health Checks** — marks backends unhealthy on connection failure, retries cooldown
+- **Active Health Checks** — background task sends `GET /health` probes every N seconds
+- **TOML Config** — listen address, backends, health check interval all in `proxy.toml`
+- **Prometheus Metrics** — `proxy_requests_total` served on a separate HTTP endpoint
+- **Structured Logging** — `RUST_LOG=info` / `RUST_LOG=debug` for full observability
+
+---
+
+## Quick Start
+
+```bash
+# Start a test backend
+python -m http.server 81 &
+
+# Start the proxy
+RUST_LOG=info cargo run --bin proxy
+
+# Send a request through it
+curl http://localhost:80
+
+# View metrics
+curl http://localhost:9090/metrics
+```
+
+### Try load balancing across two backends
+
+Edit `proxy.toml`:
+```toml
+listen = "0.0.0.0:80"
+backends = ["127.0.0.1:8081", "127.0.0.1:8082"]
+```
+
+```bash
+# Start two backends
+python -m http.server 8081 &
+python -m http.server 8082 &
+
+# Watch round-robin in action
+for i in $(seq 10); do curl -s http://localhost:80 | head -1; done
+```
+
+---
+
+## Project Structure
 
 ```
 proxy/
+├── proxy.toml              # Configuration
 ├── src/
-│   ├── main.rs              # TCP listener, connection accept, state machine
-│   ├── lib.rs               # HTTP parser: HeadParser, RequestMeta, BodyKind
-│   └── check_valid.rs       # Utility: connection liveness checks, buffer helpers
-├── Cargo.toml
-└── README.md
-```
-
-```
-client/
-├── src/
-│   └── main.rs              # Simple TCP sender
-├── Cargo.toml
-└── README.md
-```
-
-```
-exercise/
-├── src/
-│   ├── main.rs              # Placeholder
-│   └── crlf_finder.rs       # \r\n byte-slice finder
-├── Cargo.toml
+│   ├── main.rs             # TCP listener & state machine
+│   ├── lib.rs              # HTTP header parser
+│   ├── config.rs           # Config deserialization
+│   ├── check_valid.rs      # Utility helpers
+│   └── lb/
+│       └── mod.rs          # Backend pool, connection pool, health checks
+│
+client/                     # Test TCP client
+exercise/                   # Scratch code
+codebase-docs/              # Auto-generated documentation
 ```
 
 ---
 
-## Getting Started
+## Configuration (`proxy.toml`)
 
-### Prerequisites
-
-- Rust (edition 2024) — install via [rustup](https://rustup.rs/)
-- A backend server to test against (e.g., `python -m http.server 81`)
-
-### Build
-
-```bash
-cargo build --workspace
+```toml
+listen = "127.0.0.1:80"
+backends = ["127.0.0.1:81"]
+health_check_interval_secs = 10
+health_check_path = "/health"
 ```
 
-### Run
-
-```bash
-# Start the proxy (listens on 127.0.0.1:80, backends on 127.0.0.1:81)
-cargo run --bin proxy
-
-# In another terminal, start a test backend
-python -m http.server 81
-
-# Send a request through the proxy
-curl http://127.0.0.1:80
-```
-
-### Test Client
-
-```bash
-cargo run --bin client
-```
+Override the config path: `PROXY_CONFIG=custom.toml cargo run --bin proxy`
 
 ---
 
-## Configuration
+## Why This Exists
 
-Currently, all configuration is **hardcoded** in `proxy/src/main.rs`:
+Built as a hands-on exploration of:
 
-| Setting            | Value          |
-|--------------------|----------------|
-| Listen address     | `127.0.0.1:80` |
-| Backend address    | `127.0.0.1:81` |
-| Async runtime      | Tokio (full)   |
-
----
-
-## HTTP Parser API
-
-The `HeadParser` in `lib.rs` provides incremental, zero-copy-friendly header parsing:
-
-```rust
-let mut parser = HeadParser::new();
-parser.consume(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
-match parser.parse() {
-    ParseEvent::End => {
-        let meta = parser.parse_request_meta().unwrap();
-        println!("{} {}", meta.method, meta.uri);
-    }
-    _ => {}
-}
-```
-
-Supported `BodyKind` detection:
-- `ContentLength(n)` — parsed from `Content-Length` header
-- `Chunked` — parsed from `Transfer-Encoding: chunked`
-- `None` — no body present
-
----
-
-## Roadmap
-
-### Phase 1 (Current) – TCP Proxy with HTTP Awareness
-- [x] TCP listener with per-connection async handlers
-- [x] Incremental HTTP header parser
-- [x] Connection state machine (headers → body → backend → relay)
-- [x] Raw bidirectional byte proxying (`copy_bidirectional`)
-- [ ] Chunked transfer encoding body forwarding
-- [ ] Connection keep-alive support
-
-### Phase 2 – Load Balancer
-- [ ] Round-robin, least-connections, and random backend selection
-- [ ] Backend health checks (active / passive)
-- [ ] Connection pooling
-
-### Phase 3 – Production Features
-- [ ] YAML/TOML configuration file
-- [ ] TLS termination
-- [ ] Metrics and observability (Prometheus, structured logging)
-- [ ] Hot-reload of backend pool
-
----
-
-## Development
-
-```bash
-# Run the proxy with logging (add env_logger or tracing as needed)
-RUST_LOG=info cargo run --bin proxy
-
-# Run tests
-cargo test --workspace
-```
+- **Systems programming** — TCP, sockets, async I/O in Rust
+- **HTTP at the wire level** — request/response framing, chunked encoding, keep-alive semantics
+- **State machine design** — modeling protocol flows as explicit states
+- **Distributed systems** — load balancing algorithms, health checks, connection pooling
+- **Production readiness** — structured logging, metrics, config-driven design
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](./LICENSE) for details.
-
----
-
-## Acknowledgements
-
-Built as a hands-on exploration of systems programming, async I/O, HTTP semantics, and load-balancing algorithms — one connection at a time.
+MIT
