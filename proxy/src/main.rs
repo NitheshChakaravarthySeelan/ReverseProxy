@@ -1,15 +1,20 @@
 mod check_valid;
+mod config;
 mod lb;
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use check_valid::is_valid_read_len;
+use config::Config;
 use lb::{BackendConnPool, BackendPool, SharedBackendPool, SharedConnPool};
 use proxy::{HeadParser, ParseEvent, RequestMeta, BodyKind, ParseError};
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{error, info, warn};
 
 struct ResponseMeta {
     content_length: Option<usize>,
@@ -55,7 +60,7 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                             // Header line processed, stored in parser.lines
                         }
                         ParseEvent::End => {
-                            println!("Header complete");
+                            info!("Header complete");
                             match parser.parse_request_meta() {
                                 Ok(req_meta) => {
                                     let raw_headers = buf[..parser.cursor].to_vec();
@@ -74,7 +79,7 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                                     break;
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to parse request meta: {:?}", e);
+                                    error!("Failed to parse request meta: {:?}", e);
                                     state = ConnectionState::Closed;
                                     break;
                                 }
@@ -121,26 +126,26 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                 }
             }
             ConnectionState::WaitingBackend(req_meta, raw_headers, body) => {
-                println!("Waiting for backend connection...");
+                info!("Waiting for backend connection...");
 
                 let backend_addr = match pool.next_backend().await {
                     Some(addr) => addr,
                     None => {
-                        eprintln!("No healthy backends available");
+                        error!("No healthy backends available");
                         state = ConnectionState::Closed;
                         continue;
                     }
                 };
                 let mut backend_socket = match conn_pool.borrow(backend_addr).await {
                     Some(s) => {
-                        println!("Reusing pooled connection to {backend_addr}");
+                        info!("Reusing pooled connection to {backend_addr}");
                         s
                     }
                     None => {
                         match TcpStream::connect(backend_addr).await {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("Failed to connect to backend {backend_addr}: {e}");
+                                error!("Failed to connect to backend {backend_addr}: {e}");
                                 pool.mark_unhealthy(backend_addr).await;
                                 state = ConnectionState::Closed;
                                 continue;
@@ -229,24 +234,24 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
             }
             ConnectionState::KeepAliveDecision(should_close, backend_socket) => {
                 if should_close {
-                    println!("Closing connection");
+                    info!("Closing connection");
                     state = ConnectionState::Closed;
                 } else {
                     if let Some((addr, stream)) = backend_socket {
                         conn_pool.return_conn(addr, stream).await;
                     }
-                    println!("Keeping connection alive, waiting for next request");
+                    info!("Keeping connection alive, waiting for next request");
                     buf.clear();
                     parser = HeadParser::new();
                     state = ConnectionState::ReadingHeaders;
                 }
             }
             ConnectionState::Closed => {
-                println!("Connection closed.");
+                info!("Connection closed.");
                 return Ok(());
             }
             ConnectionState::Idle => {
-                eprintln!("Unexpected Idle state.");
+                error!("Unexpected Idle state.");
                 return Err(io::Error::new(io::ErrorKind::Other, "Unexpected Idle state"));
             }
         }
@@ -323,24 +328,66 @@ async fn handle_client1(mut client: TcpStream) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool: SharedBackendPool = Arc::new(BackendPool::new(vec![
-        "127.0.0.1:81".parse().unwrap(),
-    ]));
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let config_path = std::env::var("PROXY_CONFIG").unwrap_or_else(|_| "proxy.toml".to_string());
+    let config = Config::load(Path::new(&config_path))?;
+
+    info!("Starting proxy on {}", config.listen);
+    info!("Backends: {:?}", config.backends);
+
+    let pool: SharedBackendPool = Arc::new(BackendPool::new(config.backends));
     let conn_pool: SharedConnPool = Arc::new(BackendConnPool::new());
 
-    pool.start_active_health_checks(10, "/health").await;
+    pool.start_active_health_checks(config.health_check_interval_secs, &config.health_check_path).await;
 
-    let listener = TcpListener::bind("127.0.0.1:80").await?;
+    let request_counter = Arc::new(AtomicU64::new(0));
+    let metrics_counter = Arc::clone(&request_counter);
+    tokio::spawn(async move {
+        serve_metrics(metrics_counter).await.unwrap_or_else(|e| error!("Metrics server error: {e}"));
+    });
+
+    let listener = TcpListener::bind(config.listen).await?;
 
     loop {
         let (socket, _) = listener.accept().await?;
+        request_counter.fetch_add(1, Ordering::Relaxed);
         let pool = Arc::clone(&pool);
         let conn_pool = Arc::clone(&conn_pool);
 
         tokio::spawn(async move {
             if let Err(e) = handle_client(socket, pool, conn_pool).await {
-                eprintln!("connection error: {e}");
+                error!("connection error: {e}");
             }
+        });
+    }
+}
+
+async fn serve_metrics(counter: Arc<AtomicU64>) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:9090").await?;
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let counter = Arc::clone(&counter);
+        tokio::spawn(async move {
+            let count = counter.load(Ordering::Relaxed);
+            let body = format!(
+                "# HELP proxy_requests_total Total requests handled\n\
+                 # TYPE proxy_requests_total counter\n\
+                 proxy_requests_total {}\n",
+                count
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = socket.write_all(response.as_bytes()).await;
         });
     }
 }
