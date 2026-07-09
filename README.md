@@ -75,12 +75,16 @@ ReadingHeaders → ReadingBody → WaitingBackend → ReadingResponseHeaders →
 
 ## Quick Start
 
+> **Note:** Ports 80/81 require `sudo`. For testing without root, edit `proxy.toml` to use higher ports (see below).
+
+### Option 1 — Run with root (default config)
+
 ```bash
 # Start a test backend
 python -m http.server 81 &
 
 # Start the proxy
-RUST_LOG=info cargo run --bin proxy
+sudo RUST_LOG=info cargo run --bin proxy
 
 # Send a request through it
 curl http://localhost:80
@@ -89,21 +93,48 @@ curl http://localhost:80
 curl http://localhost:9090/metrics
 ```
 
+### Option 2 — Run without root (recommended for testing)
+
+Edit `proxy.toml`:
+```toml
+listen = "127.0.0.1:8080"
+backends = ["127.0.0.1:8081"]
+```
+
+```bash
+# Start a test backend
+python3 -m http.server 8081 --bind 127.0.0.1 &
+
+# Start the proxy
+RUST_LOG=info cargo run --bin proxy
+
+# Send a request through it
+curl http://127.0.0.1:8080
+
+# View metrics
+curl http://127.0.0.1:9090/metrics
+```
+
 ### Try load balancing across two backends
 
 Edit `proxy.toml`:
 ```toml
-listen = "0.0.0.0:80"
+listen = "127.0.0.1:8080"
 backends = ["127.0.0.1:8081", "127.0.0.1:8082"]
 ```
 
 ```bash
 # Start two backends
-python -m http.server 8081 &
-python -m http.server 8082 &
+python3 -m http.server 8081 --bind 127.0.0.1 &
+python3 -m http.server 8082 --bind 127.0.0.1 &
 
 # Watch round-robin in action
-for i in $(seq 10); do curl -s http://localhost:80 | head -1; done
+for i in $(seq 10); do
+  curl -s http://127.0.0.1:8080 | head -1
+done
+
+# Check metrics to see requests distributed
+curl -s http://127.0.0.1:9090/metrics | grep proxy_requests
 ```
 
 ---

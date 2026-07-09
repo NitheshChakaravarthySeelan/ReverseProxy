@@ -156,31 +156,30 @@ Expose Prometheus-style metrics:
 
 ---
 
-## Recommended Order to Implement
+## Status — All Items Implemented ✅
 
-```
-Week 1:  1.1 (forward all headers)
-         1.2 (chunked body)
-         1.3 (keep-alive)
-         ─── now the proxy is actually correct ───
+### Phase 1 — Proxy Correctness
+- [x] 1.1 Forward all headers (raw header bytes preserved)
+- [x] 1.2 Chunked body reading
+- [x] 1.3 Keep-alive (response header parsing, Content-Length tracking, connection reuse)
 
-Week 2:  2.1 (backend pool)
-         2.2 (round-robin + least-connections)
-         2.3 (connection pooling)
+### Phase 2 — Load Balancing
+- [x] 2.1 Backend pool with round-robin selection
+- [x] 2.2 Multiple backends (configurable via proxy.toml)
+- [x] 2.3 Connection pooling (idle connection reuse)
 
-Week 3:  3.1 (passive health checks)
-         3.2 (active health checks)
+### Phase 3 — Health Checks
+- [x] 3.1 Passive health checks (mark unhealthy on connection failure)
+- [x] 3.2 Active health checks (periodic GET /health probes)
 
-Week 4:  4.1 (config file)
-         4.2 (logging)
-         4.3 (metrics)
-```
-
-Each week builds on the previous. You can stop at any point and have something functional.
+### Phase 4 — Production Features
+- [x] 4.1 TOML configuration file
+- [x] 4.2 Structured logging (tracing crate)
+- [x] 4.3 Prometheus metrics endpoint (:9090/metrics)
 
 ---
 
-## Stretch Goals (if you want to go further)
+## Future Ideas (beyond this implementation)
 
 - **TLS termination** — Accept HTTPS, forward HTTP to backends.
 - **HTTP/2 support** — Significantly more complex but increasingly necessary.
