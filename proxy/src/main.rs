@@ -136,6 +136,7 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                         continue;
                     }
                 };
+
                 let mut backend_socket = match conn_pool.borrow(backend_addr).await {
                     Some(s) => {
                         info!("Reusing pooled connection to {backend_addr}");
@@ -159,7 +160,26 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                 use tokio::io::AsyncWriteExt;
                 let mut request = raw_headers.clone();
                 request.extend(&body);
-                backend_socket.write_all(&request).await?;
+
+                if backend_socket.write_all(&request).await.is_err() {
+                    info!("Cached connection to {backend_addr} was stale, retrying with fresh connection");
+                    match TcpStream::connect(backend_addr).await {
+                        Ok(mut fresh) => {
+                            let mut req = raw_headers.clone();
+                            req.extend(&body);
+                            fresh.write_all(&req).await?;
+                            state = ConnectionState::ReadingResponseHeaders(
+                                req_meta, raw_headers, body, Vec::new(), backend_addr, fresh,
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to backend {backend_addr}: {e}");
+                            pool.mark_unhealthy(backend_addr).await;
+                            state = ConnectionState::Closed;
+                        }
+                    }
+                    continue;
+                }
 
                 state = ConnectionState::ReadingResponseHeaders(
                     req_meta, raw_headers, body, Vec::new(), backend_addr, backend_socket,
@@ -174,7 +194,23 @@ async fn handle_client(mut socket: TcpStream, pool: SharedBackendPool, conn_pool
                         resp_buf.extend_from_slice(&temp[..n]);
                     }
                     _ => {
-                        state = ConnectionState::Closed;
+                        info!("Backend {backend_addr} closed connection, retrying with fresh connection");
+                        use tokio::io::AsyncWriteExt;
+                        match TcpStream::connect(backend_addr).await {
+                            Ok(mut fresh) => {
+                                let mut request = raw_headers.clone();
+                                request.extend(&body);
+                                fresh.write_all(&request).await?;
+                                state = ConnectionState::ReadingResponseHeaders(
+                                    req_meta, raw_headers, body, Vec::new(), backend_addr, fresh,
+                                );
+                            }
+                            Err(e) => {
+                                error!("Failed to reconnect to backend {backend_addr}: {e}");
+                                pool.mark_unhealthy(backend_addr).await;
+                                state = ConnectionState::Closed;
+                            }
+                        }
                         continue;
                     }
                 }
